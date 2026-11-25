@@ -11,7 +11,8 @@ from math import comb
 
 from vision import COVERED, FLAG, MINE
 
-MAX_COMPONENT = 22   # larger frontier groups fall back to a local estimate
+MAX_COMPONENT = 120     # frontier groups are enumerated exactly up to this many cells ...
+MAX_NODES = 400_000     # ... and this many search steps; beyond either, a local estimate is used
 
 
 def neighbors(c, r, cols, rows):
@@ -84,37 +85,78 @@ def _components(cons):
     return comps
 
 
-def _enumerate(cells, cons):
-    """For one frontier group: {mine count: (number of solutions, per-cell mine counts)}."""
-    index = {c: i for i, c in enumerate(cells)}
-    cons_i = [([index[c] for c in cs], need) for cs, need in cons]
-    by_cell = [[] for _ in cells]
-    for k, (cs, _) in enumerate(cons_i):
-        for i in cs:
-            by_cell[i].append(k)
-    assign = [None] * len(cells)
+def _order(cells, cons):
+    """Visit cells along the frontier (breadth-first over shared constraints), so each
+    constraint is closed soon after it is opened and contradictions are found early."""
+    by_cell = {c: [] for c in cells}
+    for k, (cs, _) in enumerate(cons):
+        for c in cs:
+            by_cell[c].append(k)
+    left = set(cells)
+    order = []
+    while left:
+        start = min(left)
+        queue, left = [start], left - {start}
+        while queue:
+            x = queue.pop(0)
+            order.append(x)
+            for k in by_cell[x]:
+                for y in sorted(cons[k][0]):
+                    if y in left:
+                        left.discard(y)
+                        queue.append(y)
+    return order
+
+
+def _enumerate(cells, cons, budget=None):
+    """For one frontier group: {mine count: (number of solutions, per-cell mine counts)},
+    in the order of `cells`. Returns None if the search exceeds `budget` steps."""
+    budget = MAX_NODES if budget is None else budget
+    order = _order(cells, cons)
+    index = {c: i for i, c in enumerate(order)}
+    n = len(order)
+    need = [nd for _, nd in cons]
+    mines = [0] * len(cons)                       # mines placed so far in each constraint
+    open_ = [len(cs) for cs, _ in cons]           # cells of each constraint still unassigned
+    by_cell = [[] for _ in order]
+    for k, (cs, _) in enumerate(cons):
+        for c in cs:
+            by_cell[index[c]].append(k)
+    assign = [0] * n
     result = {}
+    steps = [0]
 
-    def ok(k):
-        cs, need = cons_i[k]
-        m = sum(1 for i in cs if assign[i] == 1)
-        u = sum(1 for i in cs if assign[i] is None)
-        return m <= need <= m + u
-
-    def rec(i):
-        if i == len(cells):
-            m = sum(assign)
-            cnt, per = result.get(m, (0, [0] * len(cells)))
-            result[m] = (cnt + 1, [p + a for p, a in zip(per, assign)])
-            return
+    def rec(i, placed):
+        if i == n:
+            cnt, per = result.get(placed, (0, [0] * n))
+            result[placed] = (cnt + 1, [p + a for p, a in zip(per, assign)])
+            return True
+        steps[0] += 1
+        if steps[0] > budget:
+            return False
+        ks = by_cell[i]
         for v in (0, 1):
-            assign[i] = v
-            if all(ok(k) for k in by_cell[i]):
-                rec(i + 1)
-        assign[i] = None
+            good = True
+            for k in ks:
+                open_[k] -= 1
+                mines[k] += v
+                if not (mines[k] <= need[k] <= mines[k] + open_[k]):
+                    good = False
+            if good:
+                assign[i] = v
+                if not rec(i + 1, placed + v):
+                    return False
+            for k in ks:
+                open_[k] += 1
+                mines[k] -= v
+        assign[i] = 0
+        return True
 
-    rec(0)
-    return result
+    if not rec(0, 0):
+        return None
+    # back to the caller's cell order
+    pos = [index[c] for c in cells]
+    return {m: (cnt, [per[p] for p in pos]) for m, (cnt, per) in result.items()}
 
 
 def probabilities(board, total_mines):
@@ -128,9 +170,13 @@ def probabilities(board, total_mines):
     interior = [x for x in covered if x not in frontier]
     probs = {}
 
-    exact, rough = [], []
+    tables, rough = [], []
     for cells, ccons in _components(cons):
-        (exact if len(cells) <= MAX_COMPONENT else rough).append((cells, ccons))
+        table = _enumerate(cells, ccons) if len(cells) <= MAX_COMPONENT else None
+        if table is None:
+            rough.append((cells, ccons))
+        else:
+            tables.append((table, cells))
     # Rough groups: local ratio need/unknown averaged per cell.
     for cells, ccons in rough:
         for cell in cells:
@@ -139,7 +185,6 @@ def probabilities(board, total_mines):
     rough_mines = sum(probs.values())
 
     # Exact groups: combine their solution counts with the interior via binomial weights.
-    tables = [(_enumerate(cells, ccons), cells) for cells, ccons in exact]
     dist = {0: 1}  # total frontier mines -> number of ways (convolution over groups)
     for table, _ in tables:
         new = {}
